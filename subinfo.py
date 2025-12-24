@@ -20,16 +20,19 @@ TOKEN = "你的_TELEGRAM_BOT_TOKEN"
 REMOTE_MAPPINGS_URL = "https://raw.githubusercontent.com/Hyy800/Quantumult-X/refs/heads/Nana/ymys.txt"
 REMOTE_CONFIG_MAPPINGS = {}
 
-# 全局并发限制：控制全系统同时进行的网络请求数量
-GLOBAL_SEMAPHORE = asyncio.Semaphore(30)
+# 地区识别规则 (恢复原版)
+REGION_RULES = [
+    ('香港', ['香港', 'hong kong', 'hongkong', 'hk', 'hkg']),
+    ('台湾', ['台湾', 'taiwan', 'tw', 'taipei', 'tpe']),
+    ('日本', ['日本', 'japan', 'jp', 'tokyo', 'osaka', 'jap']),
+    ('新加坡', ['新加坡', 'singapore', 'sg', 'sgp']),
+    ('韩国', ['韩国', 'korea', 'kr', 'seoul', 'kor']),
+    ('美国', ['美国', 'united states', 'us', 'usa', 'los angeles', 'san jose']),
+]
 
-# 全局共享 HTTP 客户端（自动管理连接池）
-shared_client = httpx.AsyncClient(
-    timeout=httpx.Timeout(15.0, connect=5.0),
-    limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
-    follow_redirects=True,
-    headers={'User-Agent': 'Clash-Verge/1.0.0 (Windows NT 10.0; Win64; x64) Meta/1.18.0'}
-)
+# 全局并发限制
+GLOBAL_SEMAPHORE = asyncio.Semaphore(30)
+shared_client = httpx.AsyncClient(timeout=httpx.Timeout(15.0), follow_redirects=True)
 
 # --- 工具函数 ---
 
@@ -49,8 +52,47 @@ def parse_user_info(header: str):
             info[k.strip().lower()] = v.strip()
     return info
 
+def analyze_regions(proxies):
+    """恢复原版的节点地区统计逻辑"""
+    stats = {}
+    for p in proxies:
+        name = str(p.get('name', '')).lower()
+        found = False
+        for region, keywords in REGION_RULES:
+            if any(k in name for k in keywords):
+                stats[region] = stats.get(region, 0) + 1
+                found = True
+                break
+        if not found:
+            stats['其他'] = stats.get('其他', 0) + 1
+    
+    if not stats: return "无有效节点"
+    return " | ".join([f"{k}:{v}" for k, v in stats.items()])
+
+async def get_node_info(url: str):
+    """获取节点详细信息及统计"""
+    try:
+        resp = await shared_client.get(url)
+        data = resp.text
+        # Clash 格式
+        if 'proxies' in data:
+            config = yaml.safe_load(data)
+            proxies = config.get('proxies', [])
+            return {"count": len(proxies), "detail": analyze_regions(proxies)}
+        # V2Ray Base64 格式
+        try:
+            missing_padding = len(data) % 4
+            if missing_padding: data += '=' * (4 - missing_padding)
+            decoded = base64.b64decode(data).decode('utf-8')
+            lines = [l for l in decoded.splitlines() if '://' in l]
+            if lines:
+                # 简单模拟 Base64 节点名识别（可选）
+                return {"count": len(lines), "detail": f"{len(lines)}个通用节点"}
+        except: pass
+    except: pass
+    return None
+
 async def load_remote_mappings():
-    """初始化加载远程映射表"""
     global REMOTE_CONFIG_MAPPINGS
     try:
         resp = await shared_client.get(REMOTE_MAPPINGS_URL)
@@ -58,41 +100,22 @@ async def load_remote_mappings():
             if '=' in line and not line.startswith('#'):
                 k, v = line.split('=', 1)
                 REMOTE_CONFIG_MAPPINGS[k.strip()] = v.strip()
-        logging.info("远程映射表加载成功")
     except Exception as e:
         logging.error(f"加载映射失败: {e}")
 
-async def get_node_info(url: str):
-    """异步获取节点数"""
-    try:
-        resp = await shared_client.get(url)
-        data = resp.text
-        if 'proxies' in data:
-            config = yaml.safe_load(data)
-            return {"count": len(config.get('proxies', [])), "detail": "Clash"}
-        try:
-            missing_padding = len(data) % 4
-            if missing_padding: data += '=' * (4 - missing_padding)
-            decoded = base64.b64decode(data).decode('utf-8')
-            lines = [l for l in decoded.splitlines() if '://' in l]
-            if lines: return {"count": len(lines), "detail": "V2Ray/SS"}
-        except: pass
-    except: pass
-    return None
-
 async def process_sub(url: str):
-    """处理单个链接"""
     async with GLOBAL_SEMAPHORE:
         try:
-            resp = await shared_client.get(url)
+            headers = {'User-Agent': 'Clash-Verge/1.0.0'}
+            resp = await shared_client.get(url, headers=headers)
             if resp.status_code != 200:
                 return {"success": False, "url": url, "error": f"HTTP {resp.status_code}"}
             
-            user_info_raw = resp.headers.get('subscription-userinfo')
-            if not user_info_raw:
-                return {"success": False, "url": url, "error": "无流量统计Header"}
+            user_info = resp.headers.get('subscription-userinfo')
+            if not user_info:
+                return {"success": False, "url": url, "error": "该链接不返回流量信息"}
             
-            info = parse_user_info(user_info_raw)
+            info = parse_user_info(user_info)
             u, d, t, e = int(info.get('upload', 0)), int(info.get('download', 0)), int(info.get('total', 0)), int(info.get('expire', 0))
             
             used = u + d
@@ -106,7 +129,7 @@ async def process_sub(url: str):
                 "node": node, "up": u, "down": d
             }
         except Exception:
-            return {"success": False, "url": url, "error": "连接超时/失败"}
+            return {"success": False, "url": url, "error": "请求超时"}
 
 # --- 消息处理器 ---
 
@@ -114,11 +137,9 @@ async def handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg: return
 
-    # 1. 提取 URL
     content = msg.text or msg.caption or ""
     urls = re.findall(r'https?://[^\s]+', content)
 
-    # 2. 处理文本附件
     if msg.document and (msg.document.file_name.endswith('.txt') or msg.document.mime_type == 'text/plain'):
         file = await msg.document.get_file()
         byte_content = await file.download_as_bytearray()
@@ -127,65 +148,60 @@ async def handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     urls = list(dict.fromkeys(urls))
     if not urls: return
 
-    status_msg = await msg.reply_text("🚀 正在并发查询，请稍候...")
+    status_msg = await msg.reply_text("⏳ 正在获取订阅信息...")
 
-    # 3. 并发派发任务
     tasks = [process_sub(url) for url in urls]
     responses = await asyncio.gather(*tasks)
 
-    # 4. 拼装结果
     results = []
     for res in responses:
         safe_url = html.escape(res['url'])
         if not res["success"]:
-            results.append(f"❌ <code>{safe_url}</code> | <b>{res['error']}</b>")
+            results.append(f"❌ <b>解析失败</b>\n链接: <code>{safe_url}</code>\n原因: {res['error']}")
             continue
         
-        filled = min(10, int(res['percent'] / 10))
-        bar = "█" * filled + "░" * (10 - filled)
-        expire = datetime.fromtimestamp(res['expire_ts']).strftime('%Y-%m-%d') if res['expire_ts'] > 0 else "无限"
+        # 恢复原版进度条排版
+        filled = min(15, int(res['percent'] / 6.6))
+        bar = "█" * filled + "░" * (15 - filled)
+        expire_date = datetime.fromtimestamp(res['expire_ts']).strftime('%Y-%m-%d') if res['expire_ts'] > 0 else "永久/未知"
         
-        item = (
-            f"📄 <b>{html.escape(res['name'])}</b>\n"
-            f"📊 <code>{bar} {res['percent']}%</code>\n"
-            f"余: <code>{format_size(res['remain'])}</code> | 到期: <code>{expire}</code>\n"
-            f"🔗 <code>{safe_url}</code>"
+        # 恢复原版的输出模板
+        output = (
+            f"📄 <b>机场名称</b>: <code>{html.escape(res['name'])}</code>\n"
+            f"🏷️ <b>订阅链接</b>: <code>{safe_url}</code>\n"
+            f"📊 <b>流量信息</b>:\n"
+            f"预览: <code>[{bar}] {res['percent']}%</code>\n"
+            f"总流量: <code>{format_size(res['total'])}</code>\n"
+            f"已使用: <code>{format_size(res['used'])}</code> (↑{format_size(res['up'])} ↓{format_size(res['down'])})\n"
+            f"剩余量: <code>{format_size(res['remain'])}</code>\n"
+            f"⏰ <b>到期时间</b>: <code>{expire_date}</code>\n"
         )
-        results.append(item)
+        if res['node']:
+            output += f"🌐 <b>节点信息</b>: <code>{res['node']['count']}个节点 ({res['node']['detail']})</code>"
+        
+        results.append(output)
 
-    final_output = "\n\n".join(results)
-    
-    if len(final_output) > 4000:
-        # 移除HTML标签生成纯文本文件
-        clean_text = re.sub('<[^<]+?>', '', final_output)
+    # 恢复原版的分隔符
+    final_text = "\n" + ("="*20) + "\n\n".join(results)
+
+    if len(final_text) > 4000:
+        clean_text = re.sub('<[^<]+?>', '', final_text)
         bio = BytesIO(clean_text.encode())
-        bio.name = "result.txt"
-        await msg.reply_document(document=bio, caption="✅ 查询完成，结果见文件")
+        bio.name = "subscription_report.txt"
+        await msg.reply_document(document=bio, caption="✅ 结果已生成文件")
         await status_msg.delete()
     else:
-        await status_msg.edit_text(final_output, parse_mode=constants.ParseMode.HTML, disable_web_page_preview=True)
-
-# --- 主入口 ---
+        await status_msg.edit_text(final_text, parse_mode=constants.ParseMode.HTML, disable_web_page_preview=True)
 
 async def main():
-    # 1. 先加载远程数据
     await load_remote_mappings()
-    
-    # 2. 构建应用并开启并发处理
-    # concurrent_updates=True 允许同时处理多个用户的消息
     app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).build()
-    
-    # 3. 注册处理器
     app.add_handler(MessageHandler(filters.TEXT | filters.Document.Category("text/plain"), handle_request))
-    
-    print(">>> 工业级并发 Bot 已启动...")
-    
-    # 4. 运行
+    print(">>> 完美格式并发版启动成功...")
     async with app:
         await app.initialize()
         await app.start()
         await app.updater.start_polling()
-        # 保持运行
         await asyncio.Event().wait()
 
 if __name__ == "__main__":
