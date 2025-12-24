@@ -2,20 +2,20 @@ import asyncio
 import base64
 import re
 import time
-import io
+import html
 from datetime import datetime
 from io import BytesIO
 
 import httpx
 import yaml
 from telegram import Update, constants
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
 # --- 静态配置 ---
-TOKEN = "你的_TELEGRAM_BOT_TOKEN"
+TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"
 REMOTE_MAPPINGS_URL = "https://raw.githubusercontent.com/Hyy800/Quantumult-X/refs/heads/Nana/ymys.txt"
 REMOTE_CONFIG_MAPPINGS = {}
-MAX_CONCURRENT_REQUESTS = 5  # 最大并发请求数
+MAX_CONCURRENT_REQUESTS = 5  # 最大并发数
 
 # --- 工具函数 ---
 
@@ -37,26 +37,23 @@ def parse_user_info(header: str):
     return info
 
 async def get_node_info(url: str):
-    async with httpx.AsyncClient(timeout=10.0) as client:
+    async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
         try:
             resp = await client.get(url)
             data = resp.text
-            
             # 1. 尝试 YAML
             try:
                 config = yaml.safe_load(data)
                 if isinstance(config, dict) and 'proxies' in config:
                     return {"count": len(config['proxies']), "detail": "Clash/Surge"}
             except: pass
-
             # 2. 尝试 Base64
             try:
                 missing_padding = len(data) % 4
                 if missing_padding: data += '=' * (4 - missing_padding)
                 decoded = base64.b64decode(data).decode('utf-8')
                 lines = [l for l in decoded.splitlines() if '://' in l]
-                if lines:
-                    return {"count": len(lines), "detail": "V2Ray/SS"}
+                if lines: return {"count": len(lines), "detail": "V2Ray/SS"}
             except: pass
         except: pass
     return None
@@ -73,10 +70,7 @@ async def load_remote_mappings():
         except Exception as e:
             print(f"加载映射失败: {e}")
 
-# --- 核心逻辑 ---
-
 async def process_sub(url: str, semaphore: asyncio.Semaphore):
-    # 使用信号量控制并发
     async with semaphore:
         headers = {'User-Agent': 'FlClash/v0.8.76 clash-verge'}
         async with httpx.AsyncClient(headers=headers, timeout=15.0, follow_redirects=True) as client:
@@ -87,7 +81,7 @@ async def process_sub(url: str, semaphore: asyncio.Semaphore):
                 
                 user_info_raw = resp.headers.get('subscription-userinfo')
                 if not user_info_raw:
-                    return {"success": False, "url": url, "error": "无流量统计信息 (Header)"}
+                    return {"success": False, "url": url, "error": "无流量统计信息"}
                 
                 info = parse_user_info(user_info_raw)
                 upload = int(info.get('upload', 0))
@@ -106,7 +100,6 @@ async def process_sub(url: str, semaphore: asyncio.Semaphore):
                         break
                 
                 node_data = await get_node_info(url)
-                
                 return {
                     "success": True, "url": url, "name": name, "total": total, "used": used,
                     "remain": remain, "percent": percent, "expire_ts": expire_ts,
@@ -115,86 +108,79 @@ async def process_sub(url: str, semaphore: asyncio.Semaphore):
             except Exception as e:
                 return {"success": False, "url": url, "error": str(e)}
 
-# --- 指令处理器 ---
+# --- 消息处理器 ---
 
-async def subinfo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def auto_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
-    text = msg.text or msg.caption or ""
-    urls = []
+    if not msg: return
 
-    # 1. 提取链接 (当前消息、当前附件、回复的消息、回复的附件)
-    urls.extend(re.findall(r'https?://[^\s]+', text))
-    
-    # 辅助函数：从文档中读取链接
-    async def extract_from_doc(doc):
-        if doc and (doc.file_name.endswith('.txt') or doc.mime_type == 'text/plain'):
-            doc_file = await context.bot.get_file(doc.file_id)
-            byte_content = await doc_file.download_as_bytearray()
-            return re.findall(r'https?://[^\s]+', byte_content.decode('utf-8', errors='ignore'))
-        return []
+    # 提取所有链接
+    content = msg.text or msg.caption or ""
+    urls = re.findall(r'https?://[^\s]+', content)
 
-    if msg.document:
-        urls.extend(await extract_from_doc(msg.document))
+    # 如果是文件，读取内容并提取链接
+    if msg.document and (msg.document.file_name.endswith('.txt') or msg.document.mime_type == 'text/plain'):
+        doc_file = await context.bot.get_file(msg.document.file_id)
+        byte_content = await doc_file.download_as_bytearray()
+        file_text = byte_content.decode('utf-8', errors='ignore')
+        urls.extend(re.findall(r'https?://[^\s]+', file_text))
 
-    if msg.reply_to_message:
-        reply = msg.reply_to_message
-        urls.extend(re.findall(r'https?://[^\s]+', reply.text or reply.caption or ""))
-        if reply.document:
-            urls.extend(await extract_from_doc(reply.document))
-
+    # 去重
     urls = list(dict.fromkeys(urls))
+    if not urls: return # 如果没有发现链接，不执行任何操作
 
-    if not urls:
-        await msg.reply_text("❌ 未找到订阅链接。\n发送链接、上传 .txt 文件或回复文件即可查询。", parse_mode=constants.ParseMode.MARKDOWN)
-        return
+    status_msg = await msg.reply_text(f"🔍 识别到 {len(urls)} 个链接，正在查询...")
 
-    is_txt = "txt" in text.lower()
-    status_msg = await msg.reply_text(f"⏳ 发现 {len(urls)} 个链接，正在并发查询...")
-
-    # 使用信号量批量并发执行任务
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_REQUESTS)
     tasks = [process_sub(url, semaphore) for url in urls]
     responses = await asyncio.gather(*tasks)
 
     results = []
     for res in responses:
+        # 使用 HTML 模式转义，彻底解决解析报错问题
+        safe_url = html.escape(res['url'])
         if not res["success"]:
-            results.append(f"❌ 链接: `{res['url']}`\n失败: {res['error']}")
+            results.append(f"❌ <b>链接</b>: <code>{safe_url}</code>\n失败: {html.escape(res['error'])}")
             continue
         
-        filled = min(20, int(res['percent'] / 5))
-        bar = "█" * filled + "░" * (20 - filled)
+        safe_name = html.escape(res['name'])
+        filled = min(15, int(res['percent'] / 6.6))
+        bar = "█" * filled + "░" * (15 - filled)
         expire_date = datetime.fromtimestamp(res['expire_ts']).strftime('%Y-%m-%d') if res['expire_ts'] > 0 else "永久/未知"
         
         output = (
-            f"📄 *机场*: `{res['name']}`\n"
-            f"🏷️ *订阅*: `{res['url']}`\n"
-            f"📊 *流量*: `[{bar}] {res['percent']}%`\n"
-            f"总计: `{format_size(res['total'])}` | 剩余: `{format_size(res['remain'])}`\n"
-            f"已用: `{format_size(res['used'])}` (↑{format_size(res['upload'])} ↓{format_size(res['download'])})\n"
-            f"⏰ *到期*: `{expire_date}`\n"
+            f"📄 <b>机场</b>: <code>{safe_name}</code>\n"
+            f"🔗 <b>订阅</b>: <code>{safe_url}</code>\n"
+            f"📊 <b>流量</b>: <code>[{bar}] {res['percent']}%</code>\n"
+            f"总计: <code>{format_size(res['total'])}</code> | 剩余: <code>{format_size(res['remain'])}</code>\n"
+            f"已用: <code>{format_size(res['used'])}</code> (↑{format_size(res['upload'])} ↓{format_size(res['download'])})\n"
+            f"⏰ <b>到期</b>: <code>{expire_date}</code>"
         )
         if res['node']:
-            output += f"🌐 *节点*: `{res['node']['count']}个 ({res['node']['detail']})`"
+            output += f"\n🌐 <b>节点</b>: <code>{res['node']['count']}个 ({res['node']['detail']})</code>"
         results.append(output)
 
     final_text = "\n" + ("—"*15) + "\n\n".join(results)
 
-    if is_txt:
-        file_data = BytesIO(final_text.replace("*", "").replace("`", "").encode())
-        file_data.name = f"sub_report_{int(time.time())}.txt"
-        await msg.reply_document(document=file_data, caption=f"✅ 已完成 {len(urls)} 个链接的批量查询")
+    # 如果内容太长，自动转为文件发送
+    if len(final_text) > 4000:
+        clean_text = final_text.replace("<b>", "").replace("</b>", "").replace("<code>", "").replace("</code>", "")
+        file_data = BytesIO(clean_text.encode())
+        file_data.name = f"result_{int(time.time())}.txt"
+        await msg.reply_document(document=file_data, caption="✅ 查询结果过长，已生成文件报告")
         await status_msg.delete()
     else:
-        if len(final_text) > 4000:
-            final_text = final_text[:4000] + "\n\n...(内容过长，请使用 `/subinfo txt` 获取文件报告)"
-        await status_msg.edit_text(final_text, parse_mode=constants.ParseMode.MARKDOWN, disable_web_page_preview=True)
+        await status_msg.edit_text(final_text, parse_mode=constants.ParseMode.HTML, disable_web_page_preview=True)
 
 # --- 启动 ---
 
 if __name__ == "__main__":
     asyncio.run(load_remote_mappings())
     app = ApplicationBuilder().token(TOKEN).build()
-    app.add_handler(CommandHandler(["subinfo", "cha"], subinfo_handler))
-    print("Bot 已启动，支持 TXT 文件批量识别...")
+    
+    # 使用 MessageHandler 监听所有包含文字和文件的消息
+    # 只要消息里有 http 链接或者上传了 txt 文件，就会触发
+    app.add_handler(MessageHandler(filters.TEXT | filters.Document.Category("text/plain"), auto_handler))
+    
+    print("Bot 已启动，正在监听链接和 TXT 文件...")
     app.run_polling()
