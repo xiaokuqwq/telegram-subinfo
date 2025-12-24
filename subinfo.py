@@ -20,11 +20,10 @@ TOKEN = "你的_TELEGRAM_BOT_TOKEN"
 REMOTE_MAPPINGS_URL = "https://raw.githubusercontent.com/Hyy800/Quantumult-X/refs/heads/Nana/ymys.txt"
 REMOTE_CONFIG_MAPPINGS = {}
 
-# 【高性能核心】全局并发限制：允许全系统同时进行 30 个网络请求（可根据 CPU 调整）
-# 即使 100 人同时发链接，系统也会有序、高速地消化这 30 个窗口
+# 全局并发限制：控制全系统同时进行的网络请求数量
 GLOBAL_SEMAPHORE = asyncio.Semaphore(30)
 
-# 全局共享的 HTTP 客户端池，极大提升连接复用率
+# 全局共享 HTTP 客户端（自动管理连接池）
 shared_client = httpx.AsyncClient(
     timeout=httpx.Timeout(15.0, connect=5.0),
     limits=httpx.Limits(max_connections=100, max_keepalive_connections=50),
@@ -50,15 +49,27 @@ def parse_user_info(header: str):
             info[k.strip().lower()] = v.strip()
     return info
 
+async def load_remote_mappings():
+    """初始化加载远程映射表"""
+    global REMOTE_CONFIG_MAPPINGS
+    try:
+        resp = await shared_client.get(REMOTE_MAPPINGS_URL)
+        for line in resp.text.splitlines():
+            if '=' in line and not line.startswith('#'):
+                k, v = line.split('=', 1)
+                REMOTE_CONFIG_MAPPINGS[k.strip()] = v.strip()
+        logging.info("远程映射表加载成功")
+    except Exception as e:
+        logging.error(f"加载映射失败: {e}")
+
 async def get_node_info(url: str):
-    """异步获取节点数，复用全局连接"""
+    """异步获取节点数"""
     try:
         resp = await shared_client.get(url)
         data = resp.text
-        if 'proxies' in data: # YAML 简单判定
+        if 'proxies' in data:
             config = yaml.safe_load(data)
             return {"count": len(config.get('proxies', [])), "detail": "Clash"}
-        # 尝试 Base64
         try:
             missing_padding = len(data) % 4
             if missing_padding: data += '=' * (4 - missing_padding)
@@ -70,8 +81,8 @@ async def get_node_info(url: str):
     return None
 
 async def process_sub(url: str):
-    """处理单个链接的协程任务"""
-    async with GLOBAL_SEMAPHORE: # 只有拿到“通行证”的请求才能执行
+    """处理单个链接"""
+    async with GLOBAL_SEMAPHORE:
         try:
             resp = await shared_client.get(url)
             if resp.status_code != 200:
@@ -79,7 +90,7 @@ async def process_sub(url: str):
             
             user_info_raw = resp.headers.get('subscription-userinfo')
             if not user_info_raw:
-                return {"success": False, "url": url, "error": "无 Header 统计"}
+                return {"success": False, "url": url, "error": "无流量统计Header"}
             
             info = parse_user_info(user_info_raw)
             u, d, t, e = int(info.get('upload', 0)), int(info.get('download', 0)), int(info.get('total', 0)), int(info.get('expire', 0))
@@ -94,8 +105,8 @@ async def process_sub(url: str):
                 "remain": max(0, t - used), "percent": percent, "expire_ts": e,
                 "node": node, "up": u, "down": d
             }
-        except Exception as e:
-            return {"success": False, "url": url, "error": "连接超时"}
+        except Exception:
+            return {"success": False, "url": url, "error": "连接超时/失败"}
 
 # --- 消息处理器 ---
 
@@ -103,27 +114,26 @@ async def handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg = update.effective_message
     if not msg: return
 
-    # 1. 提取链接
+    # 1. 提取 URL
     content = msg.text or msg.caption or ""
     urls = re.findall(r'https?://[^\s]+', content)
 
-    # 2. 处理附件
+    # 2. 处理文本附件
     if msg.document and (msg.document.file_name.endswith('.txt') or msg.document.mime_type == 'text/plain'):
         file = await msg.document.get_file()
         byte_content = await file.download_as_bytearray()
         urls.extend(re.findall(r'https?://[^\s]+', byte_content.decode('utf-8', errors='ignore')))
 
-    urls = list(dict.fromkeys(urls)) # 去重
+    urls = list(dict.fromkeys(urls))
     if not urls: return
 
-    # 提示开始
-    status_msg = await msg.reply_text("🚀 系统正在并发处理您的请求...")
+    status_msg = await msg.reply_text("🚀 正在并发查询，请稍候...")
 
-    # 3. 并发派发任务（这里的任务是并行的，不会卡住其他用户）
+    # 3. 并发派发任务
     tasks = [process_sub(url) for url in urls]
     responses = await asyncio.gather(*tasks)
 
-    # 4. 结果拼装
+    # 4. 拼装结果
     results = []
     for res in responses:
         safe_url = html.escape(res['url'])
@@ -143,30 +153,43 @@ async def handle_request(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         results.append(item)
 
-    # 5. 高性能发送逻辑：针对多用户和大结果进行分包
     final_output = "\n\n".join(results)
     
     if len(final_output) > 4000:
-        bio = BytesIO(final_output.replace("<b>", "").replace("<code>", "").encode())
+        # 移除HTML标签生成纯文本文件
+        clean_text = re.sub('<[^<]+?>', '', final_output)
+        bio = BytesIO(clean_text.encode())
         bio.name = "result.txt"
-        await msg.reply_document(document=bio, caption="✅ 结果已汇总至文件")
+        await msg.reply_document(document=bio, caption="✅ 查询完成，结果见文件")
         await status_msg.delete()
     else:
         await status_msg.edit_text(final_output, parse_mode=constants.ParseMode.HTML, disable_web_page_preview=True)
 
-# --- 入口 ---
+# --- 主入口 ---
 
-async def init_data():
+async def main():
+    # 1. 先加载远程数据
     await load_remote_mappings()
-
-if __name__ == "__main__":
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(init_data())
     
-    # 调优参数：concurrent_updates 允许多少个用户消息同时被处理
+    # 2. 构建应用并开启并发处理
+    # concurrent_updates=True 允许同时处理多个用户的消息
     app = ApplicationBuilder().token(TOKEN).concurrent_updates(True).build()
     
+    # 3. 注册处理器
     app.add_handler(MessageHandler(filters.TEXT | filters.Document.Category("text/plain"), handle_request))
     
-    print(">>> 工业级高性能 Bot 已启动，支持上百人并发...")
-    app.run_polling()
+    print(">>> 工业级并发 Bot 已启动...")
+    
+    # 4. 运行
+    async with app:
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling()
+        # 保持运行
+        await asyncio.Event().wait()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
